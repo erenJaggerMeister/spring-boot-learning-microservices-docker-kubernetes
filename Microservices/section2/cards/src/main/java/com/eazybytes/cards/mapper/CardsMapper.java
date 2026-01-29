@@ -1,14 +1,10 @@
 package com.eazybytes.cards.mapper;
 
-
-import org.springframework.stereotype.Component;
-
 import com.eazybytes.cards.dto.CardsDTO;
 import com.eazybytes.cards.entity.Cards;
 
-@Component
 public class CardsMapper {
-    public CardsDTO mapToCardsDto(Cards cards, CardsDTO cardsDTO){
+    public static CardsDTO mapToCardsDto(Cards cards, CardsDTO cardsDTO){
         cardsDTO.setCardNumber(cards.getCardNumber());
         cardsDTO.setCardType(cards.getCardType());
         cardsDTO.setMobileNumber(cards.getMobileNumber());
@@ -18,7 +14,7 @@ public class CardsMapper {
         return cardsDTO;
     }
 
-    public Cards mapToCards(CardsDTO cardsDTO, Cards cards){
+    public static Cards mapToCards(CardsDTO cardsDTO, Cards cards){
         cards.setCardNumber(cardsDTO.getCardNumber());
         cards.setCardType(cardsDTO.getCardType());
         cards.setMobileNumber(cardsDTO.getMobileNumber());
