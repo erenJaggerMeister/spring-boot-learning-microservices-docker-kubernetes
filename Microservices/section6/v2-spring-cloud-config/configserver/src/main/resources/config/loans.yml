@@ -1,0 +1,10 @@
+build:
+  version: "3.0"
+
+loans:
+    message: "Welcome to loans application.yml related to primary loans APIs"
+    contactDetails:
+      name: "Marcellius - junior developer"
+      email: "marcellius@gmail.com"
+    onCallSupport:
+      - (+62) 823-1697-1400

@@ -1,0 +1,10 @@
+build:
+    version: "2.0"
+
+cards:
+  message: "This is from application_qa.yml configuration"
+  contactDetails:
+    name: "Marcellius_QA - Junior Developer"
+    email: "marcellius_qa@example.com"
+  onCallSupport:
+    - (+62) 823-1697-1400

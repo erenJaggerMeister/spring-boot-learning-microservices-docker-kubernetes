@@ -1,0 +1,10 @@
+build:
+  version: "3.0"
+
+cards:
+  message: "This is from application main yml 'application.yml'"
+  contactDetails:
+    name: "Marcellius - Junior Developer"
+    email: "marcelliusfelixmatius@gmail.com"
+  onCallSupport:
+    - (+62) 823-1697-1400
