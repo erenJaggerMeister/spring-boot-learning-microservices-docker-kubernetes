@@ -1,0 +1,10 @@
+build:
+    version: "1.0"
+
+loans:
+    message: "Welcome to loans application_prod.yml related to prod APIs"
+    contactDetails:
+      name: "Marcellius - junior developer"
+      email: "marcellius@gmail.com"
+    onCallSupport:
+      - (+62) 823-1697-1400
