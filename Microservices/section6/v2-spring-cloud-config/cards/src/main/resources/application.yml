@@ -2,6 +2,10 @@ server:
   port: 9000
 
 spring:
+  application:
+    name: "cards"
+  profiles:
+    active: "qa"
   datasource:
     url: jdbc:h2:mem:testdb
     driver-class-name: org.h2.Driver
@@ -16,20 +20,4 @@ spring:
       ddl-auto: update
     show-sql: true
   config:
-    import:
-      - "application_qa.yml"
-      - "application_prod.yml"
-  profiles:
-    active:
-      - "qa"
-
-build:
-  version: "3.0"
-
-cards:
-  message: "This is from application main yml 'application.yml'"
-  contactDetails:
-    name: "Marcellius - Junior Developer"
-    email: "marcelliusfelixmatius@gmail.com"
-  onCallSupport:
-    - (+62) 823-1697-1400
+    import: "optional:configserver:http://localhost:8071/"

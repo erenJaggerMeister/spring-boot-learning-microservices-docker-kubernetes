@@ -6,25 +6,21 @@
     "configurations": [
         {
             "type": "java",
-            "name": "Spring Boot: Accounts (Prod)",
+            "name": "ConfigserverApplication",
             "request": "launch",
-            "mainClass": "com.eazybytes.accounts.AccountsApplication",
-            "projectName": "accounts",
-            
-            // v.1 if using something like '--'
+            "mainClass": "com.example.configserver.ConfigserverApplication",
+            "projectName": "configserver"
+        },
+        {
+            "type": "java",
+            "name": "Spring Boot: Cards (Prod)",
+            "request": "launch",
+            "mainClass": "com.eazybytes.cards.CardsApplication",
+            "projectName": "cards",
             "args": [
                 "--spring.profiles.active=qa",
                 "--build.version=1.1"
             ]
-
-            // v.2 if using something like '-D'
-            // "vmArgs": "-Dspring.profiles.active=prod -Dbuild.version=1.3",
-
-            // v.3 id using something like capslock or env
-            // "env": {
-            //     "SPRING_PROFILES_ACTIVE": "prod",
-            //     "BUILD_VERSION": "1.8"
-            // }
         }
     ]
 }
