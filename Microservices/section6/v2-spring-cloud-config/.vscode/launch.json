@@ -6,6 +6,20 @@
     "configurations": [
         {
             "type": "java",
+            "name": "LoansApplication",
+            "request": "launch",
+            "mainClass": "com.example.loans.LoansApplication",
+            "projectName": "loans"
+        },
+        {
+            "type": "java",
+            "name": "AccountsApplication",
+            "request": "launch",
+            "mainClass": "com.eazybytes.accounts.AccountsApplication",
+            "projectName": "accounts"
+        },
+        {
+            "type": "java",
             "name": "ConfigserverApplication",
             "request": "launch",
             "mainClass": "com.example.configserver.ConfigserverApplication",
