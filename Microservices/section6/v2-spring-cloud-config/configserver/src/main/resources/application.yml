@@ -15,9 +15,20 @@ spring:
         git:
           uri: "https://github.com/erenJaggerMeister/belajar-spring-boot-configuration.git"
           default-label: main
-          timeout: 5
+          timeout: 60
           clone-on-start: true
           force-pull: true
+  rabbitmq:
+    host: "localhost"
+    port: 5672
+    username: "guest"
+    password: "guest"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
 
 encrypt:
   key: "RAYMONDCHIN123THEODERICK456"
