@@ -1,0 +1,110 @@
+version: 2
+env:
+  - GO111MODULE=on
+before:
+  hooks:
+    - go mod download
+    - go generate ./...
+    - ./scripts/completions.sh
+project_name: hookdeck
+builds:
+  - id: hookdeck-darwin
+    ldflags:
+      - -s -w -X github.com/hookdeck/hookdeck-cli/pkg/version.Version={{.Version}}
+    binary: hookdeck
+    env:
+      - CGO_ENABLED=0
+    main: ./main.go
+    goos:
+      - darwin
+    goarch:
+      - amd64
+  - id: hookdeck-darwin-arm
+    ldflags:
+      - -s -w -X github.com/hookdeck/hookdeck-cli/pkg/version.Version={{.Version}}
+    binary: hookdeck
+    env:
+      - CGO_ENABLED=0
+    main: ./main.go
+    goos:
+      - darwin
+    goarch:
+      - arm64
+release:
+  prerelease: auto
+  mode: append
+changelog:
+  disable: true
+checksum:
+  name_template: "{{ .ProjectName }}-checksums.txt"
+snapshot:
+  name_template: "{{ .Tag }}-next"
+archives:
+  - id: hookdeck
+    files:
+      - completions/*
+      - LICENSE*
+      - README*
+      - CHANGELOG*
+brews:
+  # Stable releases are published to homebrew-core via Homebrew's autobump
+  # (BrewTestBot opens version-bump PRs after each tagged release). The
+  # third-party tap publishes only the beta channel — homebrew-core does
+  # not accept pre-releases, so the `hookdeck-beta` formula lives here.
+  - name: hookdeck-beta
+    skip_upload: "{{ if not .Prerelease }}true{{ end }}"
+    ids:
+      - hookdeck
+    repository:
+      owner: hookdeck
+      name: homebrew-hookdeck
+    directory: Formula
+    homepage: https://hookdeck.com
+    description: Receive events (e.g. webhooks) on your localhost with event history, replay, and team collaboration
+
+    install: |
+      bin.install "hookdeck"
+
+      # Install completions from pre-generated files
+      bash_completion.install "completions/hookdeck.bash" => "hookdeck"
+      zsh_completion.install "completions/_hookdeck"
+
+    caveats: |
+      ❤ Thanks for installing the Hookdeck CLI beta!
+
+      ⚠️  You are using a BETA version. Report issues at:
+        https://github.com/hookdeck/hookdeck-cli/issues
+
+      If this is your first time using the CLI, run:
+        hookdeck login
+
+# TODO: Temporarily disabled until we implement code signing
+# Cask distribution causes Gatekeeper issues with unsigned binaries
+# Will re-enable once Apple Developer certificate is in place
+#
+# homebrew_casks:
+#   - name: hookdeck
+#     ids:
+#       - hookdeck
+#     repository:
+#       owner: hookdeck
+#       name: homebrew-hookdeck
+#     homepage: https://hookdeck.com
+#     description: Receive events (e.g. webhooks) on your localhost with event history, replay, and team collaboration
+#     # Install shell completions automatically
+#     completions:
+#       bash: "completions/hookdeck.bash"
+#       zsh: "completions/_hookdeck"
+#
+#     caveats: |-
+#       Thanks for installing the Hookdeck CLI!
+#
+#       ⚠️  If you see an error about a binary already existing:
+#         brew uninstall hookdeck
+#         brew install --cask hookdeck/hookdeck/hookdeck
+#
+#       Shell completions have been installed automatically.
+#       You may need to restart your shell for them to take effect.
+#
+#       First time using the CLI? Run:
+#         hookdeck login

@@ -1,0 +1,124 @@
+name: test
+
+on:
+  workflow_run:
+    workflows: ["Dependabot PR Check"]
+    types:
+      - completed
+  pull_request:
+    branches:
+      - main
+  # Run on merge to main so the merged result is tested, not just each PR branch
+  # in isolation. A PR based on stale main can merge into a combination that no
+  # PR run exercised; this catches that (compile/unit/build only — acceptance
+  # tests stay PR-gated because they hit live APIs and are slow/flaky).
+  push:
+    branches:
+      - main
+  # Allow manually triggering CI on a branch
+  workflow_dispatch: {}
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+      - name: Run unit tests
+        run: go test -short ./pkg/...
+
+  # Keeps the vulnerability scan clean rather than asserting it once. Nothing ran
+  # govulncheck before, which is how GO-2026-5932 (x/crypto/openpgp, reached only
+  # through go-github v28's package init) went unnoticed until it was the last
+  # remaining finding. See #331.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+      - name: Run govulncheck
+        # Pinned rather than @latest: a new govulncheck release could change
+        # behaviour or fail this job with no change to the repo. Bump
+        # deliberately. The vulnerability database is still fetched live, so
+        # newly disclosed issues are picked up without a version bump.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/mac.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+
+  build-linux:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'dependabot[bot]' || github.event.workflow_run.conclusion == 'success' }}
+    env:
+      # https://goreleaser.com/customization/docker_manifest/
+      DOCKER_CLI_EXPERIMENTAL: "enabled"
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Docker Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Set up Docker QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/linux.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.5
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          version: v2.12.1
+          args: release --skip=publish --snapshot -f .goreleaser/windows.yml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GORELEASER_GITHUB_TOKEN }}

@@ -1,0 +1,12 @@
+name: Acceptance Tests
+
+on:
+  pull_request:
+    branches:
+      - next
+      - main
+
+jobs:
+  acceptance:
+    uses: ./.github/workflows/acceptance.yml
+    secrets: inherit

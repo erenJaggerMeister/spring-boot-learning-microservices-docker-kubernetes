@@ -1,0 +1,637 @@
+package websocket
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	ws "github.com/gorilla/websocket"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/hookdeck/hookdeck-cli/pkg/useragent"
+)
+
+//
+// Public types
+//
+
+// Config contains the optional configuration parameters of a Client.
+type Config struct {
+	ConnectAttemptWait time.Duration
+
+	Dialer *ws.Dialer
+
+	Log *log.Logger
+
+	// Force use of unencrypted ws:// protocol instead of wss://
+	NoWSS bool
+
+	PingPeriod time.Duration
+
+	PongWait time.Duration
+
+	WriteWait time.Duration
+
+	EventHandler EventHandler
+}
+
+// EventHandler handles an event.
+type EventHandler interface {
+	ProcessEvent(IncomingMessage)
+}
+
+// EventHandlerFunc is an adapter to allow the use of ordinary
+// functions as event handlers. If f is a function with the
+// appropriate signature, EventHandlerFunc(f) is a
+// EventHandler that calls f.
+type EventHandlerFunc func(IncomingMessage)
+
+// ProcessEvent calls f(msg).
+func (f EventHandlerFunc) ProcessEvent(msg IncomingMessage) {
+	f(msg)
+}
+
+// Client is the client used to receive webhook requests from Hookdeck
+// and send back webhook responses from the local endpoint to Hookdeck.
+type Client struct {
+	// URL the client connects to
+	URL string
+
+	CLIKey string
+
+	TeamID string
+
+	// WebSocketID is the CLI session ID (e.g., "cses_DPlA9BeXxNT2rT").
+	// Sent as the `Websocket-Id` header. The server uses this to look up
+	// the session in Redis. This is NOT the same as ConnectionIDs below.
+	WebSocketID string
+
+	// ConnectionIDs are the webhook/connection IDs (e.g., ["web_abc", "web_def"])
+	// that this CLI session is listening on. Sent as the `X-Webhook-Ids` header
+	// on every connect/reconnect so the server can recreate the session in Redis
+	// if it expired. These map to `webhook_ids` on the session and are used for
+	// routing events to this CLI.
+	ConnectionIDs []string
+
+	// FiltersJSON is the JSON-encoded session filters (e.g., '{"body":{"action":"opened"}}').
+	// Sent base64-encoded as the `X-Session-Filters` header on every connect/reconnect.
+	// Empty string means no filters.
+	FiltersJSON string
+
+	// Feature that the websocket is specified for
+	//WebSocketAuthorizedFeature string
+
+	// Optional configuration parameters
+	cfg *Config
+
+	conn        *ws.Conn
+	done        chan struct{}
+	doneOnce    sync.Once
+	isConnected bool
+	// stateMu guards conn and isConnected: they are written by the connect goroutine and
+	// read by Stop(), which can run on the signal-handler goroutine.
+	stateMu sync.Mutex
+
+	NotifyExpired chan struct{}
+	notifyClose   chan error
+	send          chan *OutgoingMessage
+	stopReadPump  chan struct{}
+	stopWritePump chan struct{}
+	wg            *sync.WaitGroup
+}
+
+// Connected returns a channel that's closed when the client has finished
+// establishing the websocket connection.
+func (c *Client) Connected() <-chan struct{} {
+	d := make(chan struct{})
+
+	go func() {
+		for !c.connected() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		close(d)
+	}()
+
+	return d
+}
+
+func (c *Client) connected() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.isConnected
+}
+
+// HasConnected reports whether this client successfully established its
+// websocket connection at some point. It stays true after a disconnect, so
+// callers can distinguish "connected then dropped" from "never connected".
+func (c *Client) HasConnected() bool {
+	return c.connected()
+}
+
+func (c *Client) setConnected(isConnected bool) {
+	c.stateMu.Lock()
+	c.isConnected = isConnected
+	c.stateMu.Unlock()
+}
+
+// Run starts listening for incoming webhook requests from Hookdeck.
+func (c *Client) Run(ctx context.Context) {
+	c.setConnected(false)
+	c.cfg.Log.WithFields(log.Fields{
+		"prefix": "websocket.client.Run",
+	}).Debug("Attempting to connect to Hookdeck")
+
+	err := c.connect(ctx)
+	if err != nil {
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix": "websocket.client.Run",
+		}).Debug(err)
+
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix": "websocket.client.Run",
+		}).Debug("Failed to connect to Hookdeck. Retrying...")
+
+		if err == ErrUnknownID {
+			c.cfg.Log.WithFields(log.Fields{
+				"prefix": "websocket.client.Run",
+			}).Debug("Websocket session is expired.")
+		}
+		c.ConnectionLost()
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+		close(c.send)
+		close(c.stopReadPump)
+		close(c.stopWritePump)
+
+		return
+	case <-c.done:
+		close(c.send)
+		close(c.stopReadPump)
+		close(c.stopWritePump)
+		close(c.NotifyExpired)
+
+		return
+	case <-c.notifyClose:
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix": "websocket.client.Run",
+		}).Debug("Disconnected from Hookdeck")
+
+		c.ConnectionLost()
+		close(c.stopReadPump)
+		close(c.stopWritePump)
+		c.wg.Wait()
+	}
+}
+
+// ConnectionLost sends NotifyExpired
+func (c *Client) ConnectionLost() {
+	c.NotifyExpired <- struct{}{}
+}
+
+// Stop stops listening for incoming webhook events. It is safe to call
+// multiple times. When called while connected, it sends a clean WebSocket
+// close (code 1000) so the server can distinguish an intentional shutdown
+// from an abnormal disconnect (network drop, crash). The server treats a
+// 1000 close as a final tombstone and removes the session immediately
+// instead of holding it open for the reconnect grace window.
+func (c *Client) Stop() {
+	c.doneOnce.Do(func() {
+		// Snapshot the connection under stateMu — Stop can run on the
+		// signal-handler goroutine while the connect goroutine writes it.
+		// conn alone signals an established connection: it is only assigned
+		// after a successful upgrade, and checking isConnected too would skip
+		// the clean close in the window between changeConnection() and
+		// setConnected(true).
+		c.stateMu.Lock()
+		conn := c.conn
+		c.stateMu.Unlock()
+
+		// If we have an active connection, send a clean close frame BEFORE
+		// tearing down the pumps. This guarantees the server sees code 1000
+		// rather than the abnormal 1006 it gets when the TCP socket dies.
+		if conn != nil {
+			deadline := time.Now().Add(c.cfg.WriteWait)
+			_ = conn.WriteControl(
+				ws.CloseMessage,
+				ws.FormatCloseMessage(ws.CloseNormalClosure, "client_shutdown"),
+				deadline,
+			)
+		}
+		close(c.done)
+	})
+}
+
+// SendMessage sends a message to Hookdeck through the websocket.
+func (c *Client) SendMessage(msg *OutgoingMessage) {
+	c.send <- msg
+}
+
+func readWSConnectErrorMessage(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	if resp.Body == nil {
+		return ""
+	}
+
+	se := struct {
+		InnerError struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}{}
+
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		return ""
+	}
+
+	err = json.Unmarshal(body, &se)
+	if err != nil {
+		return ""
+	}
+
+	return se.InnerError.Message
+}
+
+var unknownIDMessage string = "Unknown WebSocket ID."
+
+// ErrUnknownID can occur when the websocket session is expired or invalid
+var ErrUnknownID error = errors.New(unknownIDMessage)
+
+func basicAuth(username, password string) string {
+	auth := username + ":" + password
+	return base64.StdEncoding.EncodeToString([]byte(auth))
+}
+
+// connect makes a single attempt to connect to the websocket URL. It returns
+// the success of the attempt.
+func (c *Client) connect(ctx context.Context) error {
+	header := http.Header{}
+	// Disable compression by requiring "identity"
+	header.Set("Accept-Encoding", "identity")
+	header.Set("User-Agent", useragent.GetEncodedUserAgent())
+	header.Set("X-Hookdeck-Client-User-Agent", useragent.GetEncodedHookdeckUserAgent())
+	header.Set("Websocket-Id", c.WebSocketID)
+	header.Set("X-Team-Id", c.TeamID)
+	header.Set("Authorization", "Basic "+basicAuth(c.CLIKey, ""))
+
+	// Send session data on every connect/reconnect so the server can
+	// recreate the session if it expired in Redis between reconnects.
+	// Filters are base64-encoded: raw UTF-8 header bytes would be decoded as
+	// latin-1 by the Node server and silently corrupt non-ASCII filter values.
+	if len(c.ConnectionIDs) > 0 {
+		header.Set("X-Webhook-Ids", strings.Join(c.ConnectionIDs, ","))
+	}
+	if c.FiltersJSON != "" {
+		header.Set("X-Session-Filters", base64.StdEncoding.EncodeToString([]byte(c.FiltersJSON)))
+	}
+
+	url := c.URL
+	if c.cfg.NoWSS && strings.HasPrefix(url, "wss") {
+		url = "ws" + strings.TrimPrefix(c.URL, "wss")
+	}
+
+	c.cfg.Log.WithFields(log.Fields{
+		"prefix": "websocket.Client.connect",
+		"url":    url,
+	}).Debug("Dialing websocket")
+
+	conn, resp, err := c.cfg.Dialer.DialContext(ctx, url, header)
+	if err != nil {
+		message := readWSConnectErrorMessage(resp)
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix":  "websocket.Client.connect",
+			"error":   err,
+			"message": message,
+		}).Debug("Websocket connection error")
+		if message == unknownIDMessage {
+			return ErrUnknownID
+		}
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	c.changeConnection(conn)
+	c.setConnected(true)
+
+	c.wg = &sync.WaitGroup{}
+	c.wg.Add(2)
+
+	go c.readPump()
+
+	go c.writePump()
+
+	c.cfg.Log.WithFields(log.Fields{
+		"prefix": "websocket.client.connect",
+	}).Debug("Connected!")
+
+	return err
+}
+
+// changeConnection takes a new connection and recreates the channels.
+func (c *Client) changeConnection(conn *ws.Conn) {
+	c.stateMu.Lock()
+	c.conn = conn
+	c.stateMu.Unlock()
+	c.notifyClose = make(chan error)
+	c.stopReadPump = make(chan struct{})
+	c.stopWritePump = make(chan struct{})
+}
+
+// readPump pumps messages from the websocket connection and pushes them into
+// RequestHandler's ProcessWebhookRequest.
+//
+// The application runs readPump in a per-connection goroutine. The application
+// ensures that there is at most one reader on a connection by executing all
+// reads from this goroutine.
+func (c *Client) readPump() {
+	defer c.wg.Done()
+
+	err := c.conn.SetReadDeadline(time.Now().Add(c.cfg.PongWait))
+	if err != nil {
+		c.cfg.Log.Debug("SetReadDeadline error: ", err)
+	}
+
+	c.conn.SetPongHandler(func(string) error {
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix": "websocket.Client.readPump",
+		}).Debug("Received pong message")
+
+		err := c.conn.SetReadDeadline(time.Now().Add(c.cfg.PongWait))
+		if err != nil {
+			c.cfg.Log.Debug("SetReadDeadline error: ", err)
+		}
+
+		return nil
+	})
+
+	for {
+		_, data, err := c.conn.ReadMessage()
+		if err != nil {
+			select {
+			case <-c.stopReadPump:
+				c.cfg.Log.WithFields(log.Fields{
+					"prefix": "websocket.Client.readPump",
+				}).Debug("stopReadPump")
+			default:
+				var closeErr *ws.CloseError
+				switch {
+				case !errors.As(err, &closeErr):
+					// read errors do not prevent websocket reconnects in the CLI so we should
+					// only display this on debug-level logging
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Debug("read error: ", err)
+				case closeErr.Code == ws.CloseNormalClosure:
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Debug("server closed the connection normally")
+				case closeErr.Code == ws.CloseGoingAway:
+					// 1001 SERVER_SHUTDOWN: the server pod is restarting (routine deploy).
+					// The reconnect loop will land on a live pod, so don't alarm the user.
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Debug("server is restarting, reconnecting: ", err)
+				case closeErr.Code == closeCodeSessionExpired:
+					// 4001 SESSION_EXPIRED: the session is gone from the server's store.
+					// Reconnecting recreates it via the X-Webhook-Ids / X-Session-Filters
+					// headers, so this is part of normal operation.
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Debug("session expired on server, reconnecting to recreate it: ", err)
+				case closeErr.Code == ws.CloseAbnormalClosure:
+					// 1006: the connection dropped without a close handshake — a network
+					// blip, laptop sleep, load balancer idle timeout, or a pod killed
+					// ungracefully. 1006 is never sent on the wire; gorilla synthesizes it
+					// for an unexpected EOF. The reconnect loop handles it, so this is
+					// routine rather than something to report.
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Debug("connection dropped, reconnecting: ", err)
+				default:
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "websocket.Client.Close",
+					}).Error("close error: ", err)
+					c.cfg.Log.WithFields(log.Fields{
+						"prefix": "hookdeckcli.ADDITIONAL_INFO",
+					}).Error("If you run into issues, please re-run with `--log-level debug` and share the output with the Hookdeck team on GitHub.")
+				}
+				c.notifyClose <- err
+			}
+
+			return
+		}
+
+		c.cfg.Log.WithFields(log.Fields{
+			"prefix":  "websocket.Client.readPump",
+			"message": string(data),
+		}).Debug("Incoming message")
+
+		var msg IncomingMessage
+		if err = json.Unmarshal(data, &msg); err != nil {
+			c.cfg.Log.Debug("Received malformed message: ", err)
+
+			continue
+		}
+
+		go c.cfg.EventHandler.ProcessEvent(msg)
+	}
+}
+
+// writePump pumps messages to the websocket connection that are queued with
+// SendWebhookResponse.
+//
+// A goroutine running writePump is started for each connection. The
+// application ensures that there is at most one writer to a connection by
+// executing all writes from this goroutine.
+func (c *Client) writePump() {
+	ticker := time.NewTicker(c.cfg.PingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.wg.Done()
+	}()
+
+	for {
+		select {
+		case whResp, ok := <-c.send:
+			err := c.conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteWait))
+			if err != nil {
+				c.cfg.Log.Debug("SetWriteDeadline error: ", err)
+			}
+
+			if !ok {
+				c.cfg.Log.WithFields(log.Fields{
+					"prefix": "websocket.Client.writePump",
+				}).Debug("Sending close message")
+
+				err = c.conn.WriteMessage(ws.CloseMessage, ws.FormatCloseMessage(ws.CloseNormalClosure, ""))
+				if err != nil {
+					c.cfg.Log.Debug("WriteMessage error: ", err)
+				}
+
+				return
+			}
+
+			c.cfg.Log.WithFields(log.Fields{
+				"prefix": "websocket.Client.writePump",
+			}).Debug("Sending text message")
+
+			err = c.conn.WriteJSON(whResp)
+			if err != nil {
+				if ws.IsUnexpectedCloseError(err, ws.CloseNormalClosure) {
+					c.cfg.Log.Error("write error: ", err)
+				}
+				// Requeue the message to be processed when writePump restarts
+				c.send <- whResp
+				c.notifyClose <- err
+
+				return
+			}
+		case <-ticker.C:
+			err := c.conn.SetWriteDeadline(time.Now().Add(c.cfg.WriteWait))
+			if err != nil {
+				c.cfg.Log.Debug("SetWriteDeadline error: ", err)
+			}
+
+			c.cfg.Log.WithFields(log.Fields{
+				"prefix": "websocket.Client.writePump",
+			}).Debug("Sending ping message")
+
+			if err = c.conn.WriteMessage(ws.PingMessage, nil); err != nil {
+				if ws.IsUnexpectedCloseError(err, ws.CloseNormalClosure) {
+					c.cfg.Log.Error("write error: ", err)
+				}
+				c.notifyClose <- err
+
+				return
+			}
+		case <-c.stopWritePump:
+			c.cfg.Log.WithFields(log.Fields{
+				"prefix": "websocket.Client.writePump",
+			}).Debug("stopWritePump")
+
+			return
+		}
+	}
+}
+
+//
+// Public functions
+//
+
+// NewClient returns a new Client.
+func NewClient(url string, webSocketID string, CLIKey string, teamID string, connectionIDs []string, filtersJSON string, cfg *Config) *Client {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+
+	if cfg.ConnectAttemptWait == 0 {
+		cfg.ConnectAttemptWait = defaultConnectAttemptWait
+	}
+
+	if cfg.Dialer == nil {
+		cfg.Dialer = newWebSocketDialer(os.Getenv("HOOKDECK_CLI_UNIX_SOCKET"))
+	}
+
+	if cfg.Log == nil {
+		cfg.Log = &log.Logger{Out: ioutil.Discard}
+	}
+
+	if cfg.PongWait == 0 {
+		cfg.PongWait = defaultPongWait
+	}
+
+	if cfg.PingPeriod == 0 {
+		cfg.PingPeriod = (cfg.PongWait * 9) / 10
+	}
+
+	if cfg.WriteWait == 0 {
+		cfg.WriteWait = defaultWriteWait
+	}
+
+	if cfg.EventHandler == nil {
+		cfg.EventHandler = nullEventHandler
+	}
+
+	// Note that this client is not configured for websocket communications
+	// and you must call c.changeConnection
+	return &Client{
+		URL:           url,
+		WebSocketID:   webSocketID,
+		CLIKey:        CLIKey,
+		TeamID:        teamID,
+		ConnectionIDs: connectionIDs,
+		FiltersJSON:   filtersJSON,
+		cfg:           cfg,
+		done:          make(chan struct{}),
+		send:          make(chan *OutgoingMessage),
+		NotifyExpired: make(chan struct{}),
+	}
+}
+
+//
+// Private constants
+//
+
+const (
+	defaultConnectAttemptWait = 10 * time.Second
+
+	defaultPongWait = 10 * time.Second
+
+	defaultWriteWait = 10 * time.Second
+
+	// closeCodeSessionExpired (4001) is sent by the server when the CLI session
+	// no longer exists in its store, either on connect (older CLIs that don't
+	// send session-recreation headers) or mid-connection (session expired during
+	// a ping). Reconnecting with the X-Webhook-Ids / X-Session-Filters headers
+	// recreates the session, so this close code is expected, not an error.
+	closeCodeSessionExpired = 4001
+)
+
+//
+// Private variables
+//
+
+var subprotocols = [...]string{"hookdeckcli-devproxy-v1"}
+
+var nullEventHandler = EventHandlerFunc(func(IncomingMessage) {})
+
+//
+// Private functions
+//
+
+func newWebSocketDialer(unixSocket string) *ws.Dialer {
+	var dialer *ws.Dialer
+
+	if unixSocket != "" {
+		dialFunc := func(network, addr string) (net.Conn, error) {
+			return net.Dial("unix", unixSocket)
+		}
+		dialer = &ws.Dialer{
+			HandshakeTimeout: 10 * time.Second,
+			NetDial:          dialFunc,
+			Subprotocols:     subprotocols[:],
+		}
+	} else {
+		dialer = &ws.Dialer{
+			HandshakeTimeout: 10 * time.Second,
+			Proxy:            http.ProxyFromEnvironment,
+			Subprotocols:     subprotocols[:],
+		}
+	}
+
+	return dialer
+}

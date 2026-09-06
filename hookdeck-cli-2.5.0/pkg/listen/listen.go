@@ -1,0 +1,294 @@
+/*
+Copyright © 2020 NAME HERE <EMAIL ADDRESS>
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+package listen
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/hookdeck/hookdeck-cli/pkg/config"
+	"github.com/hookdeck/hookdeck-cli/pkg/hookdeck"
+	"github.com/hookdeck/hookdeck-cli/pkg/listen/proxy"
+	"github.com/hookdeck/hookdeck-cli/pkg/login"
+	log "github.com/sirupsen/logrus"
+)
+
+type Flags struct {
+	NoWSS          bool
+	NoHealthcheck  bool
+	Path           string
+	MaxConnections int
+	Output         string
+	Filters        *hookdeck.SessionFilters
+}
+
+// listenCmd represents the listen command
+func Listen(URL *url.URL, sourceQuery string, connectionFilterString string, flags Flags, config *config.Config) error {
+	var err error
+	var guestURL string
+
+	sourceAliases, err := parseSourceQuery(sourceQuery)
+	if err != nil {
+		return err
+	}
+
+	isMultiSource := len(sourceAliases) > 1 || (len(sourceAliases) == 1 && sourceAliases[0] == "*")
+
+	if flags.Path != "" {
+		if isMultiSource {
+			return errors.New("Can only set a CLI path when listening to a single source")
+		}
+
+		flagIsPath, err := isPath(flags.Path)
+		if err != nil {
+			return err
+		}
+		if !flagIsPath {
+			return errors.New("The path must be in a valid format")
+		}
+	}
+
+	if config.Profile.APIKey == "" {
+		guestURL, err = login.GuestLogin(config)
+		if guestURL == "" {
+			return err
+		}
+	} else if config.Profile.GuestURL != "" && config.Profile.APIKey != "" {
+		// Guest profile: use saved URL at startup; interactive TUI refreshes async.
+		guestURL = config.Profile.GuestURL
+	}
+
+	apiClient := config.GetAPIClient()
+
+	sources, err := getSources(apiClient, sourceAliases)
+	if err != nil {
+		return err
+	}
+
+	connections, err := getConnections(apiClient, sources, connectionFilterString, isMultiSource, flags.Path)
+	if err != nil {
+		return err
+	}
+
+	if len(flags.Path) != 0 && len(connections) > 1 {
+		return errors.New(fmt.Errorf(`Multiple CLI destinations found. Cannot set the path on multiple destinations.
+Specify a single destination to update the path. For example, pass a connection name:
+
+  hookdeck listen %s %s %s --path %s`, URL.String(), sources[0].Name, "<connection>", flags.Path).Error())
+	}
+
+	// If the "--path" flag has been passed and the destination has a current cli path value but it's different, update destination path
+	currentCLIPath := connections[0].Destination.GetCLIPath()
+	if len(flags.Path) != 0 &&
+		len(connections) == 1 &&
+		currentCLIPath != nil && *currentCLIPath != "" &&
+		*currentCLIPath != flags.Path {
+
+		updateMsg := fmt.Sprintf("Updating destination CLI path from \"%s\" to \"%s\"", *currentCLIPath, flags.Path)
+		log.Debug(updateMsg)
+
+		_, err := apiClient.UpdateDestination(context.Background(), connections[0].Destination.ID, &hookdeck.DestinationUpdateRequest{
+			Config: map[string]interface{}{
+				"path": flags.Path,
+			},
+		})
+
+		if err != nil {
+			return err
+		}
+
+		connections[0].Destination.SetCLIPath(flags.Path)
+	}
+
+	sources = getRelevantSources(sources, connections)
+
+	if err := validateData(sources, connections); err != nil {
+		return err
+	}
+
+	// User-scoped CLI keys have no project_id in config, which left dashboard
+	// deep-links with an empty team_id. Fall back to the team that owns the
+	// resolved connections so links stay project-scoped.
+	projectID := resolveEffectiveProjectID(config.Profile.ProjectId, connections)
+
+	// Perform initial health check on target server (unless disabled)
+	// Using 3-second timeout optimized for local development scenarios.
+	// This assumes low latency to localhost. For production/edge deployments,
+	// this timeout may need to be configurable in future iterations.
+	if !flags.NoHealthcheck {
+		healthCheckTimeout := 3 * time.Second
+		healthResult := CheckServerHealth(URL, healthCheckTimeout, config.Insecure)
+
+		// For all output modes, warn if server isn't reachable
+		if !healthResult.Healthy {
+			warningMsg := FormatHealthMessage(healthResult, URL)
+
+			if flags.Output == "interactive" {
+				// Interactive mode will show warning before TUI starts
+				fmt.Println()
+				fmt.Println(warningMsg)
+				fmt.Println()
+				time.Sleep(500 * time.Millisecond) // Give user time to see warning before TUI starts
+			} else {
+				// Compact/quiet modes: print warning before connection info
+				fmt.Println()
+				fmt.Println(warningMsg)
+				fmt.Println()
+			}
+		}
+	}
+
+	// Start proxy
+	// For non-interactive modes, print connection info before starting
+	if flags.Output == "compact" || flags.Output == "quiet" {
+		fmt.Println()
+		printSourcesWithConnections(config, projectID, sources, connections, URL, guestURL)
+		fmt.Println()
+	}
+	// For interactive mode, connection info will be shown in TUI
+
+	// Create proxy config
+	proxyCfg := &proxy.Config{
+		DeviceName:       config.DeviceName,
+		Key:              config.Profile.APIKey,
+		ProjectID:        config.Profile.ProjectId,
+		ProjectMode:      config.Profile.ProjectMode,
+		APIBaseURL:       config.APIBaseURL,
+		DashboardBaseURL: config.DashboardBaseURL,
+		ConsoleBaseURL:   config.ConsoleBaseURL,
+		WSBaseURL:        config.WSBaseURL,
+		NoWSS:            flags.NoWSS,
+		NoHealthcheck:    flags.NoHealthcheck,
+		URL:              URL,
+		Log:              log.StandardLogger(),
+		Insecure:         config.Insecure,
+		Output:           flags.Output,
+		GuestURL:         guestURL,
+		MaxConnections:   flags.MaxConnections,
+		Filters:          flags.Filters,
+		APIClient:        apiClient,
+	}
+
+	// Create renderer based on output mode
+	rendererCfg := &proxy.RendererConfig{
+		DeviceName:       config.DeviceName,
+		APIKey:           config.Profile.APIKey,
+		APIBaseURL:       config.APIBaseURL,
+		DashboardBaseURL: config.DashboardBaseURL,
+		ConsoleBaseURL:   config.ConsoleBaseURL,
+		ProjectMode:      config.Profile.ProjectMode,
+		ProjectID:        projectID,
+		GuestURL:         guestURL,
+		TargetURL:        URL,
+		Output:           flags.Output,
+		Sources:          sources,
+		Connections:      connections,
+		Filters:          flags.Filters,
+		APIClient:        apiClient,
+		AppConfig:        config,
+	}
+
+	renderer := proxy.NewRenderer(rendererCfg)
+
+	// Create and run proxy with renderer
+	p := proxy.New(proxyCfg, connections, renderer)
+
+	err = p.Run(context.Background())
+	if err != nil {
+		// Renderer is already cleaned up, safe to print error
+		fmt.Fprintf(os.Stderr, "\n%s\n", err)
+		os.Exit(1)
+	}
+
+	return nil
+}
+
+// resolveEffectiveProjectID returns the project id to use for dashboard
+// deep-links: the profile's active project when set, otherwise the team that
+// owns the connections being listened to (user-scoped CLI keys are not tied to
+// a single project, so the profile value is empty for them).
+func resolveEffectiveProjectID(profileProjectID string, connections []*hookdeck.Connection) string {
+	if profileProjectID != "" {
+		return profileProjectID
+	}
+	for _, connection := range connections {
+		if connection != nil && connection.TeamID != "" {
+			return connection.TeamID
+		}
+	}
+	return ""
+}
+
+func parseSourceQuery(sourceQuery string) ([]string, error) {
+	var sourceAliases []string
+	if sourceQuery == "" {
+		sourceAliases = []string{}
+	} else if strings.Contains(sourceQuery, ",") {
+		sourceAliases = strings.Split(sourceQuery, ",")
+	} else if strings.Contains(sourceQuery, " ") {
+		sourceAliases = strings.Split(sourceQuery, " ")
+	} else {
+		sourceAliases = append(sourceAliases, sourceQuery)
+	}
+
+	for i := range sourceAliases {
+		sourceAliases[i] = strings.TrimSpace(sourceAliases[i])
+	}
+
+	// TODO: remove once we can support better limit
+	if len(sourceAliases) > 10 {
+		return []string{}, errors.New("max 10 sources supported")
+	}
+
+	return sourceAliases, nil
+}
+
+func isPath(value string) (bool, error) {
+	is_path, err := regexp.MatchString(`^(\/)+([/a-zA-Z0-9-_%\.\-\_\~\!\$\&\'\(\)\*\+\,\;\=\:\@]*)$`, value)
+	return is_path, err
+}
+
+func validateData(sources []*hookdeck.Source, connections []*hookdeck.Connection) error {
+	if len(connections) == 0 {
+		return errors.New("no matching connections found")
+	}
+
+	return nil
+}
+
+func getRelevantSources(sources []*hookdeck.Source, connections []*hookdeck.Connection) []*hookdeck.Source {
+	relevantSourceID := map[string]bool{}
+
+	for _, connection := range connections {
+		relevantSourceID[connection.Source.ID] = true
+	}
+
+	relevantSources := []*hookdeck.Source{}
+
+	for _, source := range sources {
+		if relevantSourceID[source.ID] {
+			relevantSources = append(relevantSources, source)
+		}
+	}
+
+	return relevantSources
+}

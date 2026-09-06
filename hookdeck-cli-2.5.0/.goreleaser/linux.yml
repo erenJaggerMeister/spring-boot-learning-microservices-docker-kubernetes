@@ -1,0 +1,75 @@
+version: 2
+env:
+  - GO111MODULE=on
+before:
+  hooks:
+    - go mod download
+    - go generate ./...
+project_name: hookdeck
+builds:
+  - id: hookdeck-linux
+    ldflags:
+      - -s -w -X github.com/hookdeck/hookdeck-cli/pkg/version.Version={{.Version}}
+    binary: hookdeck
+    env:
+      - CGO_ENABLED=0
+    main: ./main.go
+    goos:
+      - linux
+    goarch:
+      - amd64
+  - id: hookdeck-linux-arm64
+    ldflags:
+      - -s -w -X github.com/hookdeck/hookdeck-cli/pkg/version.Version={{.Version}}
+    binary: hookdeck
+    env:
+      - CGO_ENABLED=0
+    main: ./main.go
+    goos:
+      - linux
+    goarch:
+      - arm64
+release:
+  prerelease: auto
+  mode: append
+changelog:
+  disable: true
+checksum:
+  name_template: "{{ .ProjectName }}-linux-checksums.txt"
+snapshot:
+  name_template: "{{ .Tag }}-next"
+nfpms:
+  - package_name: "{{ if .Prerelease }}hookdeck-beta{{ else }}hookdeck{{ end }}"
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Arch }}"
+    builds:
+      - hookdeck-linux
+    vendor: Hookdeck
+    homepage: https://hookdeck.com
+    maintainer: Hookdeck <support@hookdeck.com>
+    description: |-
+      Hookdeck CLI utility{{ if .Prerelease }} (Beta){{ end }}
+    license: Apache 2.0
+    formats:
+      - deb
+      - rpm
+# dockers_v2 uses buildx to build multi-arch manifests in one step,
+# avoiding the "is a manifest list" error from the legacy dockers + docker_manifests flow
+dockers_v2:
+  - ids:
+      - hookdeck-linux
+      - hookdeck-linux-arm64
+    images:
+      - "hookdeck/hookdeck-cli"
+    tags:
+      - "{{ .Tag }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.name": "{{.ProjectName}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+      "repository": "https://github.com/hookdeck/hookdeck-cli"
+      "homepage": "https://hookdeck.com"
